@@ -27,3 +27,6 @@ lazy val `hello-zio` = module("hello-zio")
 
 lazy val `http-api` = module("http-api")
   .settings(libraryDependencies ++= Deps.http ++ Deps.json)
+
+lazy val `real-time-chat` = module("real-time-chat")
+  .settings(libraryDependencies ++= Deps.http ++ Deps.datastar ++ Deps.json)

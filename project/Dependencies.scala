@@ -16,7 +16,11 @@ object Deps:
     "dev.zio" %% "zio-test-sbt" % V.zio % Test
   )
 
-  val http    = Seq("dev.zio" %% "zio-http" % V.zioHttp)
-  val json    = Seq("dev.zio" %% "zio-json" % V.zioJson)
-  val config  = Seq("dev.zio" %% "zio-config" % V.zioConfig, "dev.zio" %% "zio-config-typesafe" % V.zioConfig)
+  val http     = Seq("dev.zio" %% "zio-http" % V.zioHttp)
+  val datastar = Seq("dev.zio" %% "zio-http-datastar-sdk" % V.zioHttp)
+  val json     = Seq("dev.zio" %% "zio-json" % V.zioJson)
+  val config   = Seq(
+    "dev.zio" %% "zio-config"          % V.zioConfig,
+    "dev.zio" %% "zio-config-typesafe" % V.zioConfig
+  )
   val logging = Seq("dev.zio" %% "zio-logging" % V.zioLog)
