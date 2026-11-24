@@ -1,0 +1,9 @@
+target/
+.bsp/
+.metals/
+.bloop/
+.scala-build/
+.direnv/
+.idea/
+.vscode/
+result
