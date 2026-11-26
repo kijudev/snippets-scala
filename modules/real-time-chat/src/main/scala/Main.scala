@@ -1,17 +1,204 @@
 import zio.*
 import zio.http.*
-import zio.json.*
+import zio.http.endpoint.Endpoint
+import zio.http.template2.*
+import zio.http.datastar.*
+import zio.stream.*
+import zio.schema.{DeriveSchema, Schema}
+import java.util.concurrent.TimeUnit
 
-final case class Greeting(message: String) derives JsonEncoder
+// >-------------------------------------------------------------- Basic  Models
 
-object Main extends ZIOAppDefault:
+case class ChatMessage(
+    id: String,
+    username: String,
+    content: String,
+    timestamp: Long
+)
 
-  val routes: Routes[Any, Response] = Routes(
-    Method.GET / "health"                 -> handler(Response.text("ok")),
-    Method.GET / "hello" / string("name") -> handler {
-      (name: String, _: Request) =>
-        Response.json(Greeting(s"Hello, $name!").toJson)
-    }
+object ChatMessage:
+  def apply(username: String, content: String): ChatMessage =
+    ChatMessage(
+      id = java.util.UUID.randomUUID().toString,
+      username = username,
+      content = content,
+      timestamp = System.currentTimeMillis()
+    )
+
+  given Schema[ChatMessage] = DeriveSchema.gen[ChatMessage]
+
+case class MessageRequest(username: String, content: String)
+
+object MessageRequest:
+  given Schema[MessageRequest] = DeriveSchema.gen[MessageRequest]
+
+// >------------------------------------------------------------------ Chat Room
+
+case class ChatRoom(
+    messages: Ref[List[ChatMessage]],
+    subscribers: Hub[ChatMessage]
+)
+
+object ChatRoom:
+  def apply: UIO[ChatRoom] =
+    for
+      messages    <- Ref.make(List.empty[ChatMessage])
+      subscribers <- Hub.unbounded[ChatMessage]
+    yield ChatRoom(messages, subscribers)
+
+  def addMessage(message: ChatMessage): URIO[ChatRoom, Unit] =
+    for
+      room <- ZIO.service[ChatRoom]
+      _    <- room.messages.update(_ :+ message)
+      _    <- room.subscribers.publish(message)
+    yield ()
+
+  def getMessages: URIO[ChatRoom, List[ChatMessage]] =
+    ZIO.serviceWithZIO[ChatRoom](_.messages.get)
+
+  def subscribe: URIO[ChatRoom & Scope, UStream[ChatMessage]] =
+    for
+      room  <- ZIO.service[ChatRoom]
+      queue <- room.subscribers.subscribe
+    yield ZStream.fromQueue(queue)
+
+  def layer: ZLayer[Any, Nothing, ChatRoom] = ZLayer.fromZIO(make)
+
+// >---------------------------------------------------------------- Chat Server
+
+object ChatServer extends ZIOAppDefault:
+
+  private val signal_username = Signal[String]("username")
+  private val signal_message  = Signal[String]("message")
+
+  private val chatPage: Dom = html(
+    head(
+      meta(charset := "UTF-8"),
+      meta(
+        name    := "viewport",
+        content := "width=device-width, initial-scale=1.0"
+      ),
+      title("ZIO Chat - Real-time Multi-Client Chat"),
+      datastarScript
+    ),
+    body(
+      dataInit := Endpoint(Method.GET / "chat" / "messages")
+        .out[String]
+        .datastarRequest(()),
+      div(`class` := "header")(
+        h1("ZIO Chat"),
+        p(
+          "Real-time Multi-Client Chat with ZIO, ZIO HTTP & Data star",
+          span(`class` := "connection-status")("CONNECTED")
+        )
+      ),
+      div(
+        `class`                      := "container",
+        dataSignals(signal_username) := "",
+        dataSignals(signal_message)  := ""
+      )(
+        div(`class` := "username-section")(
+          label(`for` := "username")("Your Username"),
+          input(
+            `type`      := "text",
+            id          := "username",
+            placeholder := "Enter your username...",
+            dataBind("username")
+          )
+        ),
+        div(`class` := "chat-container")(
+          div(
+            `class` := "messages",
+            id      := "messages"
+          )(
+            div(id := "message-list")
+          ),
+          div(`class` := "input-area")(
+            input(
+              `type`      := "text",
+              id          := "message",
+              placeholder := "Type your message...",
+              dataBind("message"),
+              required,
+              dataOn.keydown := js"evt.code === 'Enter' && @post('/chat/send')"
+            ),
+            button(
+              `type` := "submit",
+              dataAttr(
+                "disabled"
+              )            := js"(${signal_username} === '' || ${} === '')",
+              dataOn.click := js"@post('/chat/send')"
+            )("Send")
+          )
+        )
+      ),
+      script(js"""
+        // Auto-scroll to bottom when new messages arrive
+        const messagesContainer = document.getElementById('messages');
+        const observer = new MutationObserver(() => {
+          messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        });
+        observer.observe(messagesContainer, { childList: true, subtree: true });
+      """)
+    )
   )
 
-  def run = Server.serve(routes).provide(Server.defaultWithPort(8080))
+  private def messageTemplate(msg: ChatMessage): Dom =
+    val time = Instant
+      .ofEpochMilli(msg.timestamp)
+      .atZone(ZoneId.systemDefault())
+      .format(DateTimeFormatter.ofPattern("HH:mm:ss"))
+
+    div(`class` := "message")(
+      div(`class` := "message-header")(
+        span(`class` := "message-username")(msg.username),
+        span(`class` := "message-time")(time)
+      ),
+      div(`class` := "message-content")(msg.content)
+    )
+
+  private val routes = Routes(
+    Method.GET / "chat" -> handler {
+      Response.text(chatPage.render).addHeader("Content-Type", "text/html")
+    },
+    Method.GET / "chat" / "messages" -> events {
+      handler {
+        for
+          messages <- ChatRoom.getMessages
+          _        <- ServerSentEventGenerator.patchElements(
+            messages.map(messageTemplate),
+            PatchElementOptions(
+              selector = Some(id("message-list")),
+              mode = ElementPatchMode.Inner
+            )
+          )
+          messages <- ChatRoom.subscribe
+          _        <- messages.mapZIO { message =>
+            ServerSentEventGenerator.patchElements(
+              messageTemplate(message),
+              PatchElementOptions(
+                selector = Some(id("message-list")),
+                mode = ElementPatchMode.Append
+              )
+            )
+          }.runDrain
+        yield ()
+      }
+    },
+    Method.POST / "chat" / "send" ->
+      handler { (req: Request) =>
+        for
+          rq <- req.readSignals[MessageRequest]
+          msg = ChatMessage(username = rq.username, content = rq.message)
+          _ <- ChatRoom.addMessage(msg)
+        yield Response.ok
+      }
+  ).sandbox @@ ErrorResponseConfig.debug @@ Middleware.debug
+
+  override def run: ZIO[Any, Throwable, Unit] =
+    Server
+      .serve(routes)
+      .provide(
+        Server.default,
+        ChatRoom.layer
+      )
